@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <package_name>curl</package_name>
+  <repo_url>https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz</repo_url>
+  <mode>real</mode>
+  <filter_substring>dbg</filter_substring>
+</config>
