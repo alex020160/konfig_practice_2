@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<config>
-  <package_name>curl</package_name>
-  <repo_url>https://archive.ubuntu.com/ubuntu/dists/noble/main/binary-amd64/Packages.gz</repo_url>
-  <mode>real</mode>
-  <filter_substring>dbg</filter_substring>
-</config>
+<depviz>
+  <package name="my-lib_core-1"/>
+  <!-- можно: http(s)://..., file:///..., или относительный/абсолютный путь к существующему файлу -->
+  <repo value="tests/repo.json"/>
+  <mode value="readonly"/>
+  <filter substring="core"/>
+</depviz>
+

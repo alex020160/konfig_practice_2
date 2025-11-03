@@ -1,456 +1,217 @@
-﻿import argparse
-import gzip
-import io
-import os
-import re
-import sys
-import textwrap
-import urllib.parse
-import urllib.request
-import xml.etree.ElementTree as ET
-from collections import deque, defaultdict
+﻿#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-# -----------------------------
-# Ошибки/исключения
-# -----------------------------
+
+from __future__ import annotations
+
+import argparse
+import sys
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
+
+
 
 class ConfigError(Exception):
-    pass
+    """Базовая ошибка конфигурации с полем 'hint' для более удобного вывода."""
+    def __init__(self, message: str, *, hint: Optional[str] = None):
+        super().__init__(message)
+        self.hint = hint
 
-class RepositoryError(Exception):
-    pass
 
-class PackageNotFoundError(Exception):
-    pass
 
-# -----------------------------
-# Парсер конфигурации (XML)
-# -----------------------------
+_RE_PKG_NAME = re.compile(r"^[A-Za-z0-9._\-]+$")
 
+ALLOWED_MODES = {
+    # - readonly: читаем только локальный файл (никаких изменений)
+    # - replay: используем только то, что уже есть в файле, падать если не хватает данных
+    # - record: в будущем будем дозаписывать в файл (сейчас просто валидное значение)
+    # - mock: в будущем генерировать синтетические данные (сейчас просто валидное значение)
+    "readonly",
+    "replay",
+    "record",
+    "mock",
+}
+
+
+def _is_http_url(s: str) -> bool:
+    try:
+        p = urlparse(s)
+        return p.scheme in ("http", "https")
+    except Exception:
+        return False
+
+
+def _is_file_url(s: str) -> bool:
+    try:
+        p = urlparse(s)
+        return p.scheme == "file" and bool(p.path)
+    except Exception:
+        return False
+
+
+def _classify_repo_target(value: str) -> Tuple[str, str]:
+    raw = value.strip()
+    if not raw:
+        raise ConfigError("Пустое значение репозитория.", hint="Укажите URL или путь к файлу.")
+
+    if _is_http_url(raw):
+        return ("url", raw)
+
+    if _is_file_url(raw):
+        path = Path(urlparse(raw).path)
+        if not path.is_file():
+            raise ConfigError(
+                f"Файл репозитория не найден: {path}",
+                hint="Проверьте, что файл существует и доступен."
+            )
+        return ("file", str(path.resolve()))
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+
+    if not path.is_file():
+        raise ConfigError(
+            f"Файл репозитория не найден: {path}",
+            hint="Укажите существующий файл, либо используйте http(s):// или file:// URL."
+        )
+    return ("file", str(path))
+
+
+def _validate_package_name(name: str) -> str:
+    s = (name or "").strip()
+    if not s:
+        raise ConfigError("Имя пакета не задано.", hint="Задайте <package name=\"...\"/>.")
+    if not _RE_PKG_NAME.fullmatch(s):
+        raise ConfigError(
+            f"Недопустимое имя пакета: '{s}'",
+            hint="Разрешены латинские буквы, цифры, '.', '_' и '-'."
+        )
+    return s
+
+
+def _validate_mode(mode: str) -> str:
+    s = (mode or "").strip().lower()
+    if not s:
+        raise ConfigError("Режим не задан.", hint=f"Допустимые значения: {', '.join(sorted(ALLOWED_MODES))}.")
+    if s not in ALLOWED_MODES:
+        raise ConfigError(
+            f"Недопустимый режим: '{s}'",
+            hint=f"Допустимые значения: {', '.join(sorted(ALLOWED_MODES))}."
+        )
+    return s
+
+
+def _validate_filter_substring(sub: Optional[str]) -> str:
+    if sub is None:
+        return ""
+    s = sub.strip()
+    if not s and sub != "":
+        raise ConfigError("Подстрока фильтра содержит только пробельные символы.", hint="Либо укажите непустую подстроку, либо удалите элемент <filter/>.")
+    return s
+
+
+@dataclass
 class AppConfig:
-    def __init__(self, package_name: str, repo_url: str, mode: str, filter_substring: str):
-        self.package_name = package_name
-        self.repo_url = repo_url
-        self.mode = mode
-        self.filter_substring = filter_substring
+    package_name: str
+    repo_kind: str   
+    repo_value: str   
+    test_repo_mode: str
+    filter_substring: str
 
     @staticmethod
-    def from_xml(path: str) -> "AppConfig":
-        if not os.path.exists(path):
-            raise ConfigError(f"Файл конфигурации не найден: {path}")
-
+    def from_xml(path: Path) -> "AppConfig":
         try:
-            tree = ET.parse(path)
+            tree = ET.parse(str(path))
             root = tree.getroot()
         except ET.ParseError as e:
-            raise ConfigError(f"Некорректный XML: {e}")
+            raise ConfigError(f"Некорректный XML: {e}", hint="Проверьте закрывающие теги и кавычки.")
+        except FileNotFoundError:
+            raise ConfigError(f"Файл конфигурации не найден: {path}", hint="Передайте правильный путь к --config.")
+        except Exception as e:
+            raise ConfigError(f"Ошибка чтения конфигурации: {e}")
 
-        def get_text(tag: str, required=True, allow_empty=False) -> str:
-            el = root.find(tag)
-            if el is None:
-                if required:
-                    raise ConfigError(f"Отсутствует обязательный тег <{tag}>")
-                return ""
-            val = (el.text or "").strip()
-            if not allow_empty and val == "":
-                raise ConfigError(f"Тег <{tag}> пустой")
-            return val
+        if root.tag != "depviz":
+            raise ConfigError(
+                f"Ожидался корневой тег <depviz>, получено <{root.tag}>.",
+                hint="Обновите корневой тег на <depviz>."
+            )
 
-        package_name = get_text("package_name")
-        repo_url = get_text("repo_url")
-        mode = get_text("mode")
-        filter_substring = get_text("filter_substring", required=False, allow_empty=True)
+        pkg_el = root.find("package")
+        if pkg_el is None or "name" not in pkg_el.attrib:
+            raise ConfigError("Не найден элемент <package name=\"...\"/>.")
+        package_name = _validate_package_name(pkg_el.attrib.get("name", ""))
 
-        mode = mode.lower()
-        if mode not in ("real", "test"):
-            raise ConfigError("Тег <mode> должен быть 'real' или 'test'")
+        repo_el = root.find("repo")
+        if repo_el is None or "value" not in repo_el.attrib:
+            raise ConfigError("Не найден элемент <repo value=\"...\"/>.",
+                              hint="Укажите URL (http/https/file) или путь к файлу JSON.")
+        repo_kind, repo_value = _classify_repo_target(repo_el.attrib.get("value", ""))
 
-        if mode == "real":
-            # Валидируем URL (разрешаем http/https и прямую ссылку на Packages/Packages.gz)
-            parsed = urllib.parse.urlparse(repo_url)
-            if parsed.scheme not in ("http", "https"):
-                raise ConfigError("В режиме 'real' repo_url должен быть http/https URL на Packages или Packages.gz")
-            if not (parsed.path.endswith("Packages") or parsed.path.endswith("Packages.gz")):
-                raise ConfigError("В режиме 'real' repo_url должен указывать прямо на Packages или Packages.gz")
-        else:
-            # test — должен быть существующим файлом
-            if not os.path.exists(repo_url):
-                raise ConfigError(f"В режиме 'test' файл репозитория не найден: {repo_url}")
+        mode_el = root.find("mode")
+        if mode_el is None or "value" not in mode_el.attrib:
+            raise ConfigError("Не найден элемент <mode value=\"...\"/>.",
+                              hint=f"Допустимые значения: {', '.join(sorted(ALLOWED_MODES))}.")
+        test_repo_mode = _validate_mode(mode_el.attrib.get("value", ""))
 
-        return AppConfig(package_name, repo_url, mode, filter_substring)
+        filter_el = root.find("filter")
+        filter_substring = _validate_filter_substring(
+            None if filter_el is None else filter_el.attrib.get("substring")
+        )
 
-    def as_kv(self) -> dict:
-        return {
-            "package_name": self.package_name,
-            "repo_url": self.repo_url,
-            "mode": self.mode,
-            "filter_substring": self.filter_substring
-        }
+        return AppConfig(
+            package_name=package_name,
+            repo_kind=repo_kind,
+            repo_value=repo_value,
+            test_repo_mode=test_repo_mode,
+            filter_substring=filter_substring,
+        )
 
-# -----------------------------
-# Разбор репозитория APT (Packages/Packages.gz) и тестового файла
-# -----------------------------
 
-APT_STANZA_SEP_RE = re.compile(r"\n\s*\n", re.MULTILINE)
 
-def _http_get(url: str) -> bytes:
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        prog="depviz",
+        description="Этап 1: загрузка конфигурации из XML и вывод параметров."
+    )
+    p.add_argument(
+        "--config", "-c",
+        required=True,
+        help="Путь к XML-конфигу (например, config.xml)."
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.read()
+        cfg = AppConfig.from_xml(Path(args.config))
+    except ConfigError as e:
+        sys.stderr.write(f"[ОШИБКА] {e}\n")
+        if getattr(e, "hint", None):
+            sys.stderr.write(f"         Подсказка: {e.hint}\n")
+        return 2
     except Exception as e:
-        raise RepositoryError(f"Не удалось скачать {url}: {e}")
+        sys.stderr.write(f"[ОШИБКА] Неожиданная ошибка: {e}\n")
+        return 3
 
-def _read_packages_blob(repo_url: str) -> str:
-    blob = _http_get(repo_url)
-    # Если gz — распаковываем
-    if repo_url.endswith(".gz"):
-        try:
-            with gzip.GzipFile(fileobj=io.BytesIO(blob)) as gz:
-                data = gz.read()
-        except OSError as e:
-            raise RepositoryError(f"Не удалось распаковать Packages.gz: {e}")
-        return data.decode("utf-8", errors="replace")
-    else:
-        return blob.decode("utf-8", errors="replace")
-
-def _parse_apt_packages(packages_text: str) -> dict:
-    """
-    Возвращает dict: name -> dict(fields)
-    Поля интереса: Package, Depends, Pre-Depends
-    """
-    result = {}
-    stanzas = APT_STANZA_SEP_RE.split(packages_text.strip() + "\n\n")
-    for stanza in stanzas:
-        if not stanza.strip():
-            continue
-        fields = {}
-        # Debian control-подобный формат: ключ: значение (+ возможно continuation lines)
-        key = None
-        for line in stanza.splitlines():
-            if not line:
-                continue
-            if re.match(r"^\S+:", line):
-                k, v = line.split(":", 1)
-                key = k.strip()
-                fields[key] = v.strip()
-            else:
-                # продолжение предыдущего поля
-                if key:
-                    fields[key] += " " + line.strip()
-        pkg = fields.get("Package")
-        if pkg:
-            result[pkg] = fields
-    return result
-
-# Разбор Depends/Pre-Depends:
-# - делим по ',' на группы
-# - внутри группы делим по '|' на альтернативы, берём первую
-# - чистим имя: обрезаем версии в скобках и суффиксы архитектур ':any', ':amd64' etc.
-NAME_CLEAN_RE = re.compile(r"^[a-z0-9+.-]+", re.IGNORECASE)
-
-def _split_deps_field(value: str) -> list[str]:
-    if not value:
-        return []
-    groups = [g.strip() for g in value.split(",") if g.strip()]
-    deps = []
-    for g in groups:
-        alt = [x.strip() for x in g.split("|") if x.strip()]
-        if not alt:
-            continue
-        first = alt[0]
-        # удаляем версии в скобках
-        first = re.sub(r"\(.*?\)", "", first).strip()
-        # удаляем архитектурные суффиксы
-        first = re.sub(r":[a-z0-9]+$", "", first, flags=re.IGNORECASE).strip()
-        m = NAME_CLEAN_RE.match(first)
-        if m:
-            deps.append(m.group(0))
-    return deps
-
-def load_real_repo(repo_url: str) -> dict[str, list[str]]:
-    """
-    Возвращает отображение: package -> direct_deps
-    """
-    text = _read_packages_blob(repo_url)
-    table = _parse_apt_packages(text)
-    graph = {}
-    for name, fields in table.items():
-        deps = []
-        deps += _split_deps_field(fields.get("Pre-Depends", ""))
-        deps += _split_deps_field(fields.get("Depends", ""))
-        # уникализируем, сохраняя порядок
-        seen = set()
-        dedup = []
-        for d in deps:
-            if d not in seen:
-                seen.add(d)
-                dedup.append(d)
-        graph[name] = dedup
-    return graph
-
-def load_test_repo(path: str) -> dict[str, list[str]]:
-    """
-    Формат строк: "A: B C" или "C:".
-    Возвращает: package -> direct_deps
-    """
-    if not os.path.exists(path):
-        raise RepositoryError(f"Файл не найден: {path}")
-    graph = {}
-    with open(path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if ":" not in line:
-                raise RepositoryError(f"Строка {i}: отсутствует ':'")
-            left, right = line.split(":", 1)
-            pkg = left.strip()
-            if not re.fullmatch(r"[A-Z]+", pkg):
-                raise RepositoryError(f"Строка {i}: имя пакета должно быть из заглавных латинских букв")
-            deps = [x for x in right.strip().split() if x]
-            for d in deps:
-                if not re.fullmatch(r"[A-Z]+", d):
-                    raise RepositoryError(f"Строка {i}: имя зависимости '{d}' некорректно")
-            graph[pkg] = deps
-    # гарантируем наличие пустых списков для одиноких узлов
-    for deps in list(graph.values()):
-        for d in deps:
-            graph.setdefault(d, [])
-    return graph
-
-# -----------------------------
-# Построение графа (BFS без рекурсии) + фильтр + циклы
-# -----------------------------
-
-def build_graph_bfs(repo_graph: dict[str, list[str]],
-                    root: str,
-                    exclude_substring: str) -> dict[str, set[str]]:
-    """
-    Возвращает подграф, достижимый из root, учитывая фильтр по подстроке.
-    Формат: name -> set(children)
-    """
-    excl = (exclude_substring or "").lower()
-    def is_excluded(name: str) -> bool:
-        return excl != "" and excl in name.lower()
-
-    if root not in repo_graph:
-        raise PackageNotFoundError(f"Пакет '{root}' не найден в репозитории")
-
-    result: dict[str, set[str]] = defaultdict(set)
-    visited: set[str] = set()
-    q = deque()
-
-    if not is_excluded(root):
-        q.append(root)
-        visited.add(root)
-    else:
-        # Корневой пакет отфильтрован — граф будет пустым, но это корректно
-        return {}
-
-    while q:
-        cur = q.popleft()
-        for dep in repo_graph.get(cur, []):
-            if is_excluded(dep):
-                continue
-            result[cur].add(dep)
-            if dep not in visited:
-                visited.add(dep)
-                q.append(dep)
-            # если dep уже посещён — просто не добавляем в очередь (цикл обработан)
-    # убедимся, что все вершины присутствуют как ключи
-    for u, childs in list(result.items()):
-        for v in childs:
-            result.setdefault(v, set())
-    return result
-
-# -----------------------------
-# Этап 4: Порядок загрузки (топологическая сортировка)
-# -----------------------------
-
-def install_order_kahn(graph: dict[str, set[str]]) -> tuple[list[str], set[tuple[str, str]]]:
-    """
-    graph: u -> {v1, v2, ...}  (u зависит от v)
-    Возвращает (порядок, множество рёбер, остающихся в цикле)
-    """
-    indeg = defaultdict(int)
-    for u in graph:
-        indeg.setdefault(u, 0)
-    for u, vs in graph.items():
-        for v in vs:
-            indeg[v] += 1
-
-    q = deque([u for u, d in indeg.items() if d == 0])
-    order = []
-    # копия графа
-    g = {u: set(vs) for u, vs in graph.items()}
-
-    while q:
-        u = q.popleft()
-        order.append(u)
-        # «удаляем» вершину u и рёбра u->v
-        for v in list(g.get(u, [])):
-            g[u].remove(v)
-            indeg[v] -= 1
-            if indeg[v] == 0:
-                q.append(v)
-
-    # рёбра, которые остались — часть циклов
-    remaining_edges = set()
-    for u, vs in g.items():
-        for v in vs:
-            remaining_edges.add((u, v))
-    return order, remaining_edges
-
-# -----------------------------
-# Этап 5: Визуализация в Graphviz DOT
-# -----------------------------
-
-def to_dot(graph: dict[str, set[str]], root: str) -> str:
-    lines = ["digraph deps {", '  rankdir=LR;']
-    # выделим корень
-    if root in graph:
-        lines.append(f'  "{root}" [shape=doublecircle];')
-    # узлы/рёбра
-    nodes = set(graph.keys())
-    for vs in graph.values():
-        nodes.update(vs)
-    for n in sorted(nodes):
-        if n == root:
-            continue
-        lines.append(f'  "{n}" [shape=circle];')
-    for u, vs in graph.items():
-        for v in vs:
-            lines.append(f'  "{u}" -> "{v}";')
-    lines.append("}")
-    return "\n".join(lines)
-
-# -----------------------------
-# Печать «прямых» зависимостей
-# -----------------------------
-
-def direct_deps_of(repo_graph: dict[str, list[str]],
-                   package: str,
-                   exclude_substring: str) -> list[str]:
-    excl = (exclude_substring or "").lower()
-    if package not in repo_graph:
-        raise PackageNotFoundError(f"Пакет '{package}' не найден в репозитории")
-    deps = []
-    for d in repo_graph.get(package, []):
-        if excl and excl in d.lower():
-            continue
-        deps.append(d)
-    return deps
-
-# -----------------------------
-# CLI
-# -----------------------------
-
-def stage1_print_config(cfg: AppConfig):
-    print("Параметры конфигурации (ключ=значение):")
-    for k, v in cfg.as_kv().items():
+    # Этап 1
+    lines = [
+        ("package_name", cfg.package_name),
+        ("repo_kind", cfg.repo_kind),
+        ("repo_value", cfg.repo_value),
+        ("test_repo_mode", cfg.test_repo_mode),
+        ("filter_substring", cfg.filter_substring),
+    ]
+    for k, v in lines:
         print(f"{k}={v}")
 
-def stage2_print_direct(cfg: AppConfig, repo_graph: dict[str, list[str]]):
-    deps = direct_deps_of(repo_graph, cfg.package_name, cfg.filter_substring)
-    print(f"Прямые зависимости пакета '{cfg.package_name}':")
-    if deps:
-        for d in deps:
-            print(f"  - {d}")
-    else:
-        print("  (нет)")
+    return 0
 
-def stage3_build_graph(cfg: AppConfig, repo_graph: dict[str, list[str]]):
-    subgraph = build_graph_bfs(repo_graph, cfg.package_name, cfg.filter_substring)
-    print(f"Построен граф зависимостей (BFS) для '{cfg.package_name}':")
-    print(f"  узлов: {len(subgraph) or 0}")
-    edges = sum(len(vs) for vs in subgraph.values())
-    print(f"  рёбер: {edges}")
-    # Небольшая сводка
-    for u in sorted(subgraph.keys()):
-        vs = ", ".join(sorted(subgraph[u])) if subgraph[u] else "—"
-        print(f"  {u} -> {vs}")
-
-def stage4_install_order(cfg: AppConfig, repo_graph: dict[str, list[str]]):
-    subgraph = build_graph_bfs(repo_graph, cfg.package_name, cfg.filter_substring)
-    order, remains = install_order_kahn(subgraph)
-    print(f"Порядок загрузки (топологическая сортировка) для '{cfg.package_name}':")
-    if order:
-        print("  " + " -> ".join(order))
-    else:
-        print("  (пусто)")
-    if remains:
-        print("Внимание: обнаружены циклы, рёбра внутри цикла(ов):")
-        for u, v in sorted(remains):
-            print(f"  {u} -> {v}")
-
-    # Пояснение возможных расхождений с apt
-    print("\nПримечание о возможных расхождениях с реальным менеджером пакетов:")
-    print("- альтернативные зависимости (A | B) — здесь берётся первая альтернатива; apt может выбрать другую;")
-    print("- Pre-Depends/скрипты postinst/Triggers — apt учитывает порядок иначе;")
-    print("- виртуальные пакеты/Provides — в этой реализации не разрешаются;")
-    print("- архитектуры и pin-приоритеты — игнорируются.")
-
-def stage5_print_dot(cfg: AppConfig, repo_graph: dict[str, list[str]]):
-    subgraph = build_graph_bfs(repo_graph, cfg.package_name, cfg.filter_substring)
-    dot = to_dot(subgraph, cfg.package_name)
-    print(dot)
-
-def load_repo(cfg: AppConfig) -> dict[str, list[str]]:
-    if cfg.mode == "real":
-        return load_real_repo(cfg.repo_url)
-    else:
-        return load_test_repo(cfg.repo_url)
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Визуализация графа зависимостей apt-пакетов (без менеджеров пакетов)."
-    )
-    parser.add_argument("--config", required=True, help="Путь к XML-файлу конфигурации")
-    parser.add_argument("--stage", required=True, type=int, choices=[1, 2, 3, 4, 5],
-                        help="Номер этапа для демонстрации")
-    args = parser.parse_args()
-
-    try:
-        cfg = AppConfig.from_xml(args.config)
-    except ConfigError as e:
-        print(f"[CONFIG ERROR] {e}", file=sys.stderr)
-        sys.exit(2)
-
-    if args.stage == 1:
-        # Только печать параметров и демонстрация валидации
-        try:
-            stage1_print_config(cfg)
-        except Exception as e:
-            print(f"[ERROR] {e}", file=sys.stderr)
-            sys.exit(1)
-        return
-
-    # Для этапов 2–5 уже нужно загрузить репозиторий
-    try:
-        repo_graph = load_repo(cfg)
-    except (RepositoryError, ConfigError) as e:
-        print(f"[REPO ERROR] {e}", file=sys.stderr)
-        sys.exit(3)
-
-    try:
-        if args.stage == 2:
-            stage2_print_direct(cfg, repo_graph)
-        elif args.stage == 3:
-            stage3_build_graph(cfg, repo_graph)
-        elif args.stage == 4:
-            stage4_install_order(cfg, repo_graph)
-        elif args.stage == 5:
-            stage5_print_dot(cfg, repo_graph)
-    except PackageNotFoundError as e:
-        print(f"[PACKAGE ERROR] {e}", file=sys.stderr)
-        sys.exit(4)
-    except KeyboardInterrupt:
-        print("Остановка по Ctrl+C", file=sys.stderr)
-        sys.exit(130)
-    except Exception as e:
-        print(f"[UNEXPECTED ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
 
 if __name__ == "__main__":
-    main()
-
+    raise SystemExit(main(sys.argv[1:]))

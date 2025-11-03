@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<depviz>
+  <package name="pkg"/>
+  <repo value="tests/repo.json"/>
+  <mode value="writeable"/>
+</depviz>

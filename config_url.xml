@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<depviz>
+  <package name="demo.lib"/>
+  <repo value="https://example.org/repo.json"/>
+  <mode value="replay"/>
+  <filter substring="lib"/>
+</depviz>
