@@ -1,0 +1,8 @@
+<config>
+  <package name="apt"/>
+  <repo value="https://archive.ubuntu.com/ubuntu/dists/jammy-updates/main/binary-amd64/Packages.gz"/>
+  <mode value="readonly"/>
+  <filter substring="lib"/>
+</config>
+
+
