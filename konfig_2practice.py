@@ -469,6 +469,57 @@ def print_dot(adj: Dict[str, list[str]], root: str) -> None:
             print(f'  "{n}";')
     print("}")
 
+#4 этап
+
+def reachable_nodes(adj: Dict[str, list[str]], root: str) -> Set[str]:
+    seen: Set[str] = set()
+    q: Deque[str] = deque([root])
+    while q:
+        u = q.popleft()
+        if u in seen:
+            continue
+        seen.add(u)
+        for v in adj.get(u, []):
+            if v not in seen:
+                q.append(v)
+    return seen
+
+def induced_subgraph(adj: Dict[str, list[str]], nodes: Set[str]) -> Dict[str, list[str]]:
+    sub: Dict[str, list[str]] = {u: [] for u in nodes}
+    for u in nodes:
+        sub[u] = [v for v in adj.get(u, []) if v in nodes]
+    return sub
+
+def print_install_order(adj: Dict[str, list[str]], root: str) -> None:
+    print("\n[Этап 4] Порядок загрузки (установки) зависимостей:")
+
+    reach = reachable_nodes(adj, root)
+    sub = induced_subgraph(adj, reach)
+    topo, cycle_nodes = kahn_toposort_and_cycle_nodes(sub)
+
+    if cycle_nodes:
+        print("Строгий порядок недостижим: обнаружены циклы.")
+        print("Узлы в циклах:", ", ".join(sorted(cycle_nodes)))
+        only_acyclic = [x for x in topo if x not in cycle_nodes]
+        if only_acyclic:
+            print("Допустимый порядок для ацикличной части:")
+            print(" -> ".join(only_acyclic))
+        else:
+            print("(вся достижимая часть лежит в циклах)")
+        return
+
+    order = [x for x in topo if x in reach]
+    order = list(reversed(order))  #порядок установки — зависимости первыми
+
+    if not order:
+        print("(граф пуст или изолированный корень)")
+        return
+
+    print(" -> ".join(order))
+    if order[-1] != root and root in order:
+        print(f"(корень '{root}' в этом порядке на позиции {order.index(root) + 1} из {len(order)})")
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="depviz",
@@ -561,6 +612,10 @@ def main(argv: list[str]) -> int:
         print_bfs_levels(adj, cfg.package_name)
         print_transitive_ops(adj, cfg.package_name)
         print_dot(adj, cfg.package_name)
+
+         #4 этап
+        print_install_order(adj, cfg.package_name)
+
 
     except ConfigError as e:
         sys.stderr.write(f"[ОШИБКА Этап 3] {e}\n")
