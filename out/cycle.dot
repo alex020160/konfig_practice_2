@@ -1,0 +1,18 @@
+digraph deps {
+  rankdir=LR;
+  graph [fontname="Helvetica"];
+  node  [fontname="Helvetica", shape=ellipse];
+  edge  [fontname="Helvetica"];
+  "A" [shape=box, style=filled, fillcolor="#eef"];
+  "A" [style="filled,bold", fillcolor="#fdd"];
+  "B" [style=filled, fillcolor="#fdd"];
+  "C" [style=filled, fillcolor="#fdd"];
+  "A" -> "B";
+  "B" -> "C";
+  "C" -> "A";
+  "A";
+  "B";
+  "C";
+  labelloc="t";
+  label="Граф зависимостей для \"A\"\n(Этап 5)";
+}

@@ -1,0 +1,6 @@
+<config>
+  <package name="A"/>
+  <repo value="testdata/webserver.txt"/>
+  <mode value="readonly"/>
+  <filter substring=""/>
+</config>

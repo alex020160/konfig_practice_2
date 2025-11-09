@@ -16,6 +16,9 @@ from urllib.error import URLError, HTTPError
 from collections import deque, defaultdict
 from typing import Deque, Dict, Set, Tuple, Iterable, Callable
 from urllib.request import url2pathname 
+import shutil
+import subprocess
+
 
 
 
@@ -519,14 +522,86 @@ def print_install_order(adj: Dict[str, list[str]], root: str) -> None:
     if order[-1] != root and root in order:
         print(f"(корень '{root}' в этом порядке на позиции {order.index(root) + 1} из {len(order)})")
 
+#5 этап
+
+def build_dot(adj: Dict[str, list[str]], root: str) -> str:
+    topo, cycle_nodes = kahn_toposort_and_cycle_nodes(adj)
+
+    lines = []
+    lines.append('digraph deps {')
+    lines.append('  rankdir=LR;')
+    lines.append('  graph [fontname="Helvetica"];')
+    lines.append('  node  [fontname="Helvetica", shape=ellipse];')
+    lines.append('  edge  [fontname="Helvetica"];')
+
+    # стиль для корня и узлов-циклов
+    lines.append(f'  "{root}" [shape=box, style=filled, fillcolor="#eef"];')
+
+    #все узлы
+    nodes: Set[str] = set(adj.keys())
+    for vs in adj.values():
+        nodes.update(vs)
+
+    # цикл-узлы
+    for n in sorted(cycle_nodes):
+        if n == root:
+            lines.append(f'  "{n}" [style="filled,bold", fillcolor="#fdd"];')
+        else:
+            lines.append(f'  "{n}" [style=filled, fillcolor="#fdd"];')
+
+    # рёбра
+    for u, vs in adj.items():
+        for v in vs:
+            lines.append(f'  "{u}" -> "{v}";')
+
+    # для прочих узлов (без спец-стиля) - видимы даже без рёбер
+    for n in sorted(nodes):
+        lines.append(f'  "{n}";')
+
+    # легенда
+    lines.append('  labelloc="t";')
+    lines.append(f'  label="Граф зависимостей для \\"{root}\\"\\n(Этап 5)";')
+    lines.append('}')
+    return "\n".join(lines)
+
+
+def write_dot_and_render(dot_text: str, dot_out: Optional[str], fmt: str = "png") -> Optional[str]:
+
+    rendered_path = None
+    if dot_out:
+        out_path = Path(dot_out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(dot_text, encoding="utf-8")
+
+        dot_bin = shutil.which("dot")
+        if dot_bin:
+            render_path = out_path.with_suffix(f".{fmt}")
+            try:
+                subprocess.run(
+                    [dot_bin, "-T", fmt, str(out_path), "-o", str(render_path)],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                rendered_path = str(render_path)
+            except Exception as e:
+                sys.stderr.write(f"[WARN] Graphviz 'dot' не удалось отрендерить файл: {e}\n")
+        else:
+            sys.stderr.write("[WARN] Graphviz (dot) не найден в PATH — будет сохранён только .dot\n")
+    return rendered_path
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="depviz",
-        description="Этап 1+2+3: XML-конфиг, прямые Depends, транзитивный граф BFS (с тестовым режимом)."
+        description="Этап 1..5: конфиг, Depends, граф BFS, порядок установки, визуализация (Graphviz)."
     )
     p.add_argument("--config", "-c", required=True, help="Путь к XML-конфигу.")
+    # этап 5
+    p.add_argument("--dot-out", help="Сохранить DOT-граф в файл (.dot). Если установлен Graphviz, будет сгенерировано изображение рядом.")
+    p.add_argument("--dot-format", default="png", help="Формат рендера Graphviz (png/svg/pdf). По умолчанию: png.")
     return p.parse_args(argv)
+
 
 def exclude_in_alternatives(dep_groups: list[list[str]], substring: str) -> list[list[str]]:
     if not substring:
@@ -616,6 +691,21 @@ def main(argv: list[str]) -> int:
          #4 этап
         print_install_order(adj, cfg.package_name)
 
+        #5 этап запуск python konfig_2practice.py --config configs/webserver_5.xml --dot-out out/webserver.dot --dot-format png + добавить $Env:PATH += ";C:\Program Files\Graphviz\bin"
+
+
+        dot_text = build_dot(adj, cfg.package_name)
+
+        #вывод DOT-графа на экран
+        print("\n[Этап 5] DOT (Graphviz):")
+        print(dot_text)
+
+        #сохранить .dot и отрендерить
+        rendered = write_dot_and_render(dot_text, getattr(args, "dot_out", None), getattr(args, "dot_format", "png"))
+        if args.dot_out:
+            print(f"[Этап 5] DOT сохранён: {args.dot_out}")
+            if rendered:
+                print(f"[Этап 5] Изображение сгенерировано: {rendered}")
 
     except ConfigError as e:
         sys.stderr.write(f"[ОШИБКА Этап 3] {e}\n")
