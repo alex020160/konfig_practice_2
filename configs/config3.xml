@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <package name="A"/>
+  <repo value="test_repo.txt"/> <!-- можно и file:///C:/.../test_repo.txt -->
+  <mode value="readonly"/>
+  <filter substring=""/>         <!-- все пакеты учитываем -->
+</config>

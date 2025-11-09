@@ -1,0 +1,7 @@
+<config>
+  <package name="A"/>
+  <repo value="file:///C:/Users/Alexandra/Desktop/ВУЗ/Конф_управл/konfig-2practice/testdata/diamond.txt"/>
+  <mode value="readonly"/>
+  <filter substring=""/>
+</config>
+

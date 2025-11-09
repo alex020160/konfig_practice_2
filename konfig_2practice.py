@@ -1,8 +1,6 @@
-﻿#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 
 from __future__ import annotations
-
 import argparse
 import gzip
 import io
@@ -15,6 +13,10 @@ from typing import Optional, List
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
+from collections import deque, defaultdict
+from typing import Deque, Dict, Set, Tuple, Iterable, Callable
+from urllib.request import url2pathname 
+
 
 
 class ConfigError(Exception):
@@ -252,13 +254,239 @@ def get_direct_dependencies(packages_url: str, pkg_name: str) -> list[list[str]]
     
         return _parse_depends(", ".join(merged))
 
+#3 этап
+
+_UPPER_NAME_RE = re.compile(r"^[A-Z]+$")
+
+def load_test_repo_graph(path_or_fileurl: str) -> Dict[str, list[list[str]]]:
+    p = urlparse(path_or_fileurl)
+    if p.scheme == "file":
+        path = Path(url2pathname(p.path))
+    else:
+        path = Path(path_or_fileurl)
+
+    if not path.is_file():
+        raise ConfigError(f"Файл тестового репозитория не найден: {path}")
+
+    text = path.read_text(encoding="utf-8")
+
+    index: Dict[str, List[List[str]]] = {}
+    all_names: Set[str] = set()
+
+    for i, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise ConfigError(f"Строка {i}: ожидается 'NAME: deps...'", hint="Например: A: B C")
+        left, right = [x.strip() for x in line.split(":", 1)]
+        if not _UPPER_NAME_RE.fullmatch(left):
+            raise ConfigError(f"Строка {i}: недопустимое имя '{left}'", hint="Имя должно быть A..Z")
+        deps: list[str] = []
+        if right:
+            for name in right.split():
+                if not _UPPER_NAME_RE.fullmatch(name):
+                    raise ConfigError(f"Строка {i}: недопустимое имя завис-ти '{name}'", hint="Имя должно быть A..Z")
+                deps.append(name)
+        index[left] = [[d] for d in deps]
+        all_names.add(left)
+        all_names.update(deps)
+
+    for n in list(all_names):
+        index.setdefault(n, [])
+    return index
+#граф, BFS и операции 
+
+def choose_from_alternatives(alts: list[str]) -> str:
+    """Детерминированно выбираем одну альтернативу: лексикографический минимум."""
+    return sorted(alts)[0]
+
+def build_graph_bfs(
+    get_deps: Callable[[str], list[list[str]]],
+    root: str,
+    *,
+    ignore_sub: str = ""
+) -> Tuple[Dict[str, list[str]], Dict[str, list[list[str]]]]:
+    ignore = (ignore_sub or "").lower()
+    def allowed(name: str) -> bool:
+        return not (ignore and (ignore in name.lower()))
+
+    adj: Dict[str, list[str]] = {}
+    raw: Dict[str, list[list[str]]] = {}
+    q: Deque[str] = deque()
+    seen: Set[str] = set()
+
+    if allowed(root):
+        q.append(root)
+
+    while q:
+        u = q.popleft()
+        if u in seen:
+            continue
+        seen.add(u)
+
+        deps_alts = get_deps(u) or []
+        raw[u] = deps_alts
+
+        concrete: list[str] = []
+        for alts in deps_alts:
+            filtered = [x for x in alts if allowed(x)]
+            if not filtered:
+                continue
+            v = choose_from_alternatives(filtered)
+            if allowed(v):
+                concrete.append(v)
+        adj[u] = concrete
+
+        for v in concrete:
+            if v not in seen:
+                q.append(v)
+
+    adj.setdefault(root, adj.get(root, []))
+    raw.setdefault(root, raw.get(root, []))
+    return adj, raw
+
+def reverse_graph(adj: Dict[str, list[str]]) -> Dict[str, Set[str]]:
+    rg: Dict[str, Set[str]] = defaultdict(set)
+    nodes: Set[str] = set(adj.keys())
+    for vs in adj.values():
+        nodes.update(vs)
+    for u in nodes:
+        rg.setdefault(u, set())
+    for u, vs in adj.items():
+        for v in vs:
+            rg[v].add(u)
+    return rg
+
+def transitive_dependencies(adj: Dict[str, list[str]], start: str) -> Set[str]:
+    seen: Set[str] = set()
+    q: Deque[str] = deque(adj.get(start, []))
+    while q:
+        u = q.popleft()
+        if u in seen:
+            continue
+        seen.add(u)
+        for v in adj.get(u, []):
+            if v not in seen:
+                q.append(v)
+    return seen
+
+def dependents(adj: Dict[str, list[str]], target: str) -> Set[str]:
+    rg = reverse_graph(adj)
+    seen: Set[str] = set()
+    q: Deque[str] = deque(rg.get(target, []))
+    while q:
+        u = q.popleft()
+        if u in seen:
+            continue
+        seen.add(u)
+        for v in rg.get(u, []):
+            if v not in seen:
+                q.append(v)
+    return seen
+
+def kahn_toposort_and_cycle_nodes(adj: Dict[str, list[str]]) -> Tuple[list[str], Set[str]]:
+    nodes: Set[str] = set(adj.keys())
+    for vs in adj.values():
+        nodes.update(vs)
+    indeg: Dict[str, int] = {u: 0 for u in nodes}
+    for u, vs in adj.items():
+        for v in vs:
+            indeg[v] += 1
+    q: Deque[str] = deque([u for u in nodes if indeg[u] == 0])
+    topo: list[str] = []
+    while q:
+        u = q.popleft()
+        topo.append(u)
+        for v in adj.get(u, []):
+            indeg[v] -= 1
+            if indeg[v] == 0:
+                q.append(v)
+    cycle_nodes: Set[str] = {u for u, d in indeg.items() if d > 0}
+    return topo, cycle_nodes
+
+#вывод/визуализация
+
+def print_edges(adj: Dict[str, list[str]]) -> None:
+    print("\n[Этап 3] Рёбра графа (u -> v):")
+    empty = True
+    for u, vs in adj.items():
+        for v in vs:
+            print(f"{u} -> {v}")
+            empty = False
+    if empty:
+        print("(нет рёбер)")
+
+def print_bfs_levels(adj: Dict[str, list[str]], root: str) -> None:
+    print("\n[Этап 3] Уровни BFS от корня:", root)
+    seen: Set[str] = set([root])
+    q: Deque[Tuple[str, int]] = deque([(root, 0)])
+    levels: Dict[int, list[str]] = defaultdict(list)
+    while q:
+        u, d = q.popleft()
+        levels[d].append(u)
+        for v in adj.get(u, []):
+            if v not in seen:
+                seen.add(v)
+                q.append((v, d + 1))
+    for d in sorted(levels):
+        print(f"  [{d}] " + ", ".join(sorted(levels[d])))
+
+def print_toposort_or_cycles(adj: Dict[str, list[str]]) -> None:
+    topo, cycle_nodes = kahn_toposort_and_cycle_nodes(adj)
+    if cycle_nodes:
+        print("\n[Этап 3] Узлы, участвующие в циклах:")
+        print(", ".join(sorted(cycle_nodes)))
+    else:
+        print("\n[Этап 3] Топологический порядок:")
+        if topo:
+            print(" -> ".join(topo))
+        else:
+            print("(граф пуст)")
+
+def print_transitive_ops(adj: Dict[str, list[str]], root: str) -> None:
+    deps = transitive_dependencies(adj, root)
+    print("\n[Этап 3] Транзитивные зависимости корня:")
+    print(", ".join(sorted(deps)) if deps else "(нет зависимостей)")
+
+    rev = dependents(adj, root)
+    print("\n[Этап 3] Пакеты, зависящие (транзитивно) от корня:")
+    print(", ".join(sorted(rev)) if rev else "(нет зависимых)")
+
+def print_dot(adj: Dict[str, list[str]], root: str) -> None:
+    print("\n[Этап 3] DOT-граф:")
+    print("digraph deps {")
+    print("  rankdir=LR;")
+    print(f'  "{root}" [shape=box, style=filled, fillcolor="#eef"];')
+    nodes: Set[str] = set([root])
+    for u, vs in adj.items():
+        nodes.add(u)
+        nodes.update(vs)
+        for v in vs:
+            print(f'  "{u}" -> "{v}";')
+    for n in nodes:
+        if n != root:
+            print(f'  "{n}";')
+    print("}")
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="depviz",
-        description="Этап 1+2: XML-конфиг + вывод параметров + извлечение прямых зависимостей из APT Packages."
+        description="Этап 1+2+3: XML-конфиг, прямые Depends, транзитивный граф BFS (с тестовым режимом)."
     )
     p.add_argument("--config", "-c", required=True, help="Путь к XML-конфигу.")
     return p.parse_args(argv)
+
+def exclude_in_alternatives(dep_groups: list[list[str]], substring: str) -> list[list[str]]:
+    if not substring:
+        return dep_groups
+    sub = substring.lower()
+    cleaned: list[list[str]] = []
+    for alts in dep_groups:
+        kept = [name for name in alts if sub not in name.lower()]
+        if kept:
+            cleaned.append(kept)
+    return cleaned
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
@@ -273,34 +501,30 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"[ОШИБКА] Неожиданная ошибка: {e}\n")
         return 3
 
-    #Этап 1
+    #1 этап
     print(f"package_name={cfg.package_name}")
     print(f"repo_kind={cfg.repo_kind}")
     print(f"repo_value={cfg.repo_value}")
     print(f"test_repo_mode={cfg.test_repo_mode}")
     print(f"filter_substring={cfg.filter_substring}")
 
-    # этап 2
+    # 2 этап
     try:
         if cfg.repo_kind != "url":
-            print("\n[Этап 2] Пропущено: repo_kind не 'url'. Укажите прямой URL на Packages/Packages.gz.")
-            return 0
-
-        deps = get_direct_dependencies(cfg.repo_value, cfg.package_name)
-
-        if cfg.filter_substring:
-            sub = cfg.filter_substring.lower()
-            deps = [alts for alts in deps if any(sub in name.lower() for name in alts)]
-
-        print("\n[Этап 2] Прямые зависимости (Depends) для пакета:", cfg.package_name)
-        if not deps:
-            print("(зависимостей не найдено или поле Depends пустое)")
+            print("\n[Этап 2] Пропущено: repo_kind не 'url'. Для URL показываем только прямые Depends.")
         else:
-            for i, alts in enumerate(deps, 1):
-                if len(alts) == 1:
-                    print(f"{i}. {alts[0]}")
-                else:
-                    print(f"{i}. " + " | ".join(alts))
+            deps = get_direct_dependencies(cfg.repo_value, cfg.package_name)
+
+            #изменение с этапом 3
+            if cfg.filter_substring:
+                deps = exclude_in_alternatives(deps, cfg.filter_substring)
+
+            print("\n[Этап 2] Прямые зависимости (Depends) для пакета:", cfg.package_name)
+            if not deps:
+                print("(зависимостей не найдено после применения фильтра или поле Depends пустое)")
+            else:
+                for i, alts in enumerate(deps, 1):
+                    print(f"{i}. " + (" | ".join(alts) if len(alts) > 1 else alts[0]))
 
     except ConfigError as e:
         sys.stderr.write(f"[ОШИБКА Этап 2] {e}\n")
@@ -310,6 +534,42 @@ def main(argv: list[str]) -> int:
     except Exception as e:
         sys.stderr.write(f"[ОШИБКА Этап 2] Неожиданная ошибка: {e}\n")
         return 5
+
+    #3 этап
+    try:
+        ignore = cfg.filter_substring
+
+        if cfg.repo_kind == "url":
+            #репозиторий
+            def _fetch(name: str) -> list[list[str]]:
+                try:
+                    return get_direct_dependencies(cfg.repo_value, name)
+                except ConfigError:
+                    #отсутствие узла - отсутствие зависимостей
+                    return []
+            adj, raw = build_graph_bfs(_fetch, cfg.package_name, ignore_sub=ignore)
+
+        else:
+            #тестовый режим
+            test_index = load_test_repo_graph(cfg.repo_value)
+            def _fetch(name: str) -> list[list[str]]:
+                return test_index.get(name, [])
+            adj, raw = build_graph_bfs(_fetch, cfg.package_name, ignore_sub=ignore)
+
+        print_edges(adj)
+        print_toposort_or_cycles(adj)          # либо топопорядок, либо узлы циклов
+        print_bfs_levels(adj, cfg.package_name)
+        print_transitive_ops(adj, cfg.package_name)
+        print_dot(adj, cfg.package_name)
+
+    except ConfigError as e:
+        sys.stderr.write(f"[ОШИБКА Этап 3] {e}\n")
+        if e.hint:
+            sys.stderr.write(f"               Подсказка: {e.hint}\n")
+        return 6
+    except Exception as e:
+        sys.stderr.write(f"[ОШИБКА Этап 3] Неожиданная ошибка: {e}\n")
+        return 7
 
     return 0
 
